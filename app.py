@@ -1,470 +1,224 @@
-# app.py — Streamlit
-# ✅ Sem caminhos fixos / Sem args / Com upload
-# ✅ Modo 1: Análise simples (1 arquivo)
-# ✅ Modo 2: Comparativo 2024 x 2025 (2 arquivos + ICMS opcional)
-# ✅ Gráficos; no comparativo: Excel + PDF para download
-
+# app.py
+import os
 import io
-import re
-import unicodedata
-from typing import Dict, List
 import pandas as pd
 import streamlit as st
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter
-from matplotlib.backends.backend_pdf import PdfPages
+import plotly.express as px
+import plotly.graph_objects as go
 
-# ------------------ Config ------------------
-st.set_page_config(page_title="Arrecadação — Análise e Comparativo", layout="wide")
-PT_MONTHS = ["Jan","Fev","Mar","Abr","Mai","Jun","Jul","Ago","Set","Out","Nov","Dez"]
-MONTHS_2024 = ["Jan_2024","Fev_2024","Mar_2024","Abr_2024","Mai_2024","Jun_2024"]
-MONTHS_2025 = ["Jan_2025","Fev_2025","Mar_2025","Abr_2025","Mai_2025","Jun_2025"]
-MODEL_FALLBACK = ["FPM","ICMS","FEP","ITR","CFM","FUS","CID","FEB","SNA","ADO"]
+st.set_page_config(page_title="Comparativo de Receitas • Resumo 1S", layout="wide")
 
-# ------------------ Helpers ------------------
-def strip_accents(s: str) -> str:
-    if s is None: return ""
-    return "".join(c for c in unicodedata.normalize("NFKD", str(s)) if not unicodedata.combining(c))
-
-def norm_name(s: str) -> str:
-    s = strip_accents(str(s)).strip().lower()
-    return re.sub(r"[^a-z0-9]+","_", s).strip("_")
-
-def fmt_brl(x, pos=None):
+# --------------------------
+# Helpers
+# --------------------------
+def format_brl(v):
     try:
-        return f"R$ {x:,.0f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except Exception:
-        return str(x)
+        return str(v)
 
-def order_sheets_by_month(sheet_names: List[str]) -> List[str]:
-    month_idx = {m:i for i,m in enumerate(PT_MONTHS)}
-    scored = []
-    for name in sheet_names:
-        m = re.match(r"^([A-Za-z]{3})", strip_accents(name).strip(), flags=re.IGNORECASE)
-        if m:
-            key = strip_accents(m.group(1)).title()
-            if key in month_idx:
-                scored.append((month_idx[key], name))
-                continue
-        scored.append((999, name))
-    scored.sort(key=lambda x: (x[0], sheet_names.index(x[1])))
-    return [name for _, name in scored]
+def find_year_column(cols, year):
+    year = str(year)
+    # procura por colunas que contenham "2024" ou "2025"
+    candidates = [c for c in cols if year in str(c)]
+    # prioriza colunas que mencionem Jan-Jun ou algo parecido
+    pref = [c for c in candidates if "JAN" in str(c).upper() or "JUN" in str(c).upper() or "1S" in str(c).upper()]
+    if pref:
+        return pref[0]
+    return candidates[0] if candidates else None
 
-def normalize_sheet(df: pd.DataFrame) -> pd.DataFrame:
-    """Garante colunas Segmento, Crédito, Débito, Líquido; calcula Líquido se faltar."""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Segmento","Crédito","Débito","Líquido"])
-
-    # Normaliza nomes
-    cols_map = {}
-    for c in df.columns:
-        n = norm_name(c)
-        if n.startswith("segmento"): cols_map[c] = "Segmento"
-        elif n.startswith("credito"): cols_map[c] = "Crédito"
-        elif n.startswith("debito"):  cols_map[c] = "Débito"
-        elif n.startswith("liquido"): cols_map[c] = "Líquido"
-    df = df.rename(columns=cols_map)
-
-    # Segmento
-    if "Segmento" not in df.columns:
-        # tenta usar a 1ª coluna textual como Segmento
-        for c in df.columns:
-            if df[c].dtype == object:
-                df = df.rename(columns={c: "Segmento"})
-                break
-    if "Segmento" not in df.columns:
-        return pd.DataFrame(columns=["Segmento","Crédito","Débito","Líquido"])
-
-    # Números
-    for c in ["Crédito","Débito","Líquido"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # Líquido
-    if "Líquido" not in df.columns:
-        if "Crédito" in df.columns and "Débito" in df.columns:
-            df["Líquido"] = df["Crédito"].fillna(0.0) - df["Débito"].fillna(0.0)
-        else:
-            df["Líquido"] = pd.to_numeric(df.get("Líquido", 0.0), errors="coerce").fillna(0.0)
-
-    if "Crédito" not in df.columns: df["Crédito"] = 0.0
-    if "Débito"  not in df.columns: df["Débito"]  = 0.0
-
-    out = df[["Segmento","Crédito","Débito","Líquido"]].copy()
-    out["Segmento"] = out["Segmento"].astype(str).str.strip()
-    return out.fillna(0.0)
-
-def read_excel_all_sheets(uploaded_file) -> Dict[str, pd.DataFrame]:
-    return pd.read_excel(uploaded_file, sheet_name=None)
-
-# --------- ICMS parsing (opcional no comparativo) ----------
-def parse_icms_map(icms_sheets: Dict[str, pd.DataFrame]) -> dict:
-    """ICMS.xlsx (1ª aba) -> {year: {MonLabel: value}}"""
-    if not icms_sheets: return {}
-    name = list(icms_sheets.keys())[0]
-    df = icms_sheets[name].copy()
-    if df is None or df.empty: return {}
-    df.columns = [strip_accents(str(c)).strip().lower() for c in df.columns]
-
-    year_col = None
-    for c in df.columns:
-        if "arrecada" in c and "icms" in c:
-            year_col = c; break
-    if year_col is None:
-        for c in df.columns:
-            if df[c].astype(str).str.contains("2024|2025").any():
-                year_col = c; break
-    if year_col is None: return {}
-
-    months = {
-        "janeiro":"Jan","fevereiro":"Fev","marco":"Mar","março":"Mar","abril":"Abr","maio":"Mai",
-        "junho":"Jun","julho":"Jul","agosto":"Ago","setembro":"Set","outubro":"Out","novembro":"Nov","dezembro":"Dez"
-    }
-    icms_map={}
-    for _, row in df.iterrows():
-        y = pd.to_numeric(row[year_col], errors="coerce")
-        if pd.isna(y): continue
-        y = int(y)
-        per={}
-        for c in df.columns:
-            if c in months: per[months[c]] = row[c]
-        icms_map[y]=per
-    return icms_map
-
-def upsert_icms_row(df: pd.DataFrame, value) -> pd.DataFrame:
-    if value is None: return df
-    val = float(pd.to_numeric(value, errors="coerce")) if pd.notna(value) else 0.0
-    mask = df["Segmento"].astype(str).str.upper().str.strip() == "ICMS"
-    if mask.any():
-        i = df.index[mask][0]
-        df.at[i,"Crédito"]=val; df.at[i,"Débito"]=0.0; df.at[i,"Líquido"]=val
+@st.cache_data(show_spinner=False)
+def load_resumo(path: str, sheet_guess: str = "Resumo_1S") -> pd.DataFrame:
+    xls = pd.ExcelFile(path)
+    # tenta achar uma planilha que contenha "Resumo"
+    sheet = None
+    if sheet_guess in xls.sheet_names:
+        sheet = sheet_guess
     else:
-        df = pd.concat([df, pd.DataFrame([{"Segmento":"ICMS","Crédito":val,"Débito":0.0,"Líquido":val}])], ignore_index=True)
-    return df
+        for s in xls.sheet_names:
+            if "RESUM" in s.upper():  # Resumo / Resumo_1S
+                sheet = s
+                break
+        if sheet is None:
+            # cai na primeira aba
+            sheet = xls.sheet_names[0]
 
-# ----------------- Gráficos genéricos -----------------
-def chart_bar_by_segment(df: pd.DataFrame, month_label: str, metric: str):
-    data = df.groupby("Segmento", as_index=False)[metric].sum()
-    fig, ax = plt.subplots(figsize=(10,6))
-    ax.bar(data["Segmento"], data[metric])
-    ax.set_title(f"{month_label}: {metric} por segmento")
-    ax.set_xticklabels(data["Segmento"], rotation=45, ha="right")
-    ax.yaxis.set_major_formatter(FuncFormatter(fmt_brl))
-    fig.tight_layout()
-    return fig
+    df = pd.read_excel(path, sheet_name=sheet)
+    # normaliza cabeçalhos
+    df.columns = [str(c).strip() for c in df.columns]
 
-def chart_line_totals(month_dfs: dict, title="Total líquido por mês"):
-    rows = [{"Mês": name, "Total_Líquido": df["Líquido"].sum()} for name, df in month_dfs.items()]
-    tot = pd.DataFrame(rows)
-    tot["Mês"] = pd.Categorical(tot["Mês"], categories=order_sheets_by_month(tot["Mês"].tolist()), ordered=True)
-    tot = tot.sort_values("Mês")
-    fig, ax = plt.subplots(figsize=(10,5.5))
-    ax.plot(tot["Mês"], tot["Total_Líquido"], marker="o")
-    ax.set_title(title)
-    ax.set_xticklabels(tot["Mês"], rotation=45, ha="right")
-    ax.yaxis.set_major_formatter(FuncFormatter(fmt_brl))
-    fig.tight_layout()
-    return fig
+    # encontra colunas
+    # tenta detectar a coluna de categoria/segmento
+    seg_col = None
+    for cand in ["Segmento", "SEGMENTO", "Categoria", "Receita", "Natureza", "Descrição"]:
+        if cand in df.columns:
+            seg_col = cand
+            break
+    if seg_col is None:
+        # usa a primeira coluna como categoria
+        seg_col = df.columns[0]
 
-def chart_stacked_top_segments(month_dfs: dict, top_n=6, title="Top segmentos — Líquido (empilhado por mês)"):
-    frames = []
-    for name, df in month_dfs.items():
-        tmp = df.groupby("Segmento", as_index=False)["Líquido"].sum()
-        tmp["Mês"] = name
-        frames.append(tmp)
-    if not frames:
-        fig, ax = plt.subplots(); ax.text(0.5,0.5,"Sem dados", ha="center"); return fig
-    mat = pd.concat(frames, ignore_index=True)
-    mat["Mês"] = pd.Categorical(mat["Mês"], categories=order_sheets_by_month(mat["Mês"].unique().tolist()), ordered=True)
-    mat = mat.pivot_table(index="Segmento", columns="Mês", values="Líquido", aggfunc="sum", fill_value=0.0)
-    totals = mat.sum(axis=1).sort_values(ascending=False)
-    top = totals.head(top_n).index
-    mat_top = mat.loc[top]
+    c2024 = find_year_column(df.columns, 2024)
+    c2025 = find_year_column(df.columns, 2025)
 
-    fig, ax = plt.subplots(figsize=(11,6.5))
-    bottom = None
-    for seg in mat_top.index:
-        vals = mat_top.loc[seg].values
-        if bottom is None:
-            ax.bar(mat_top.columns, vals, label=seg)
-            bottom = vals
-        else:
-            ax.bar(mat_top.columns, vals, bottom=bottom, label=seg)
-            bottom = bottom + vals
-    ax.set_title(title)
-    ax.yaxis.set_major_formatter(FuncFormatter(fmt_brl))
-    ax.legend(loc="upper left", bbox_to_anchor=(1,1))
-    fig.tight_layout()
-    return fig
+    if c2024 is None or c2025 is None:
+        raise ValueError("Não encontrei colunas de 2024 e 2025. Verifique se a planilha resumo possui colunas como '2024_Jan-Jun' e '2025_Jan-Jun'.")
 
-# ----------------- Comparativo (2024 x 2025) -----------------
-def find_model_order_from_2025(sheets_2025: dict) -> list:
-    # prioriza aba "Resumo Jan-Jul 2025" (case-insensitive)
-    target = None
-    for name in sheets_2025.keys():
-        if strip_accents(name).strip().lower() == strip_accents("Resumo Jan-Jul 2025").lower():
-            target = name; break
-    if target is not None and "Segmento" in sheets_2025[target].columns:
-        order = [s for s in sheets_2025[target]["Segmento"].astype(str) if s.strip()]
-        if "ICMS" not in order:
-            if "FPM" in order:
-                i = order.index("FPM")+1
-                order = order[:i] + ["ICMS"] + order[i:]
-            else:
-                order.append("ICMS")
-        return order
+    # seleciona e renomeia
+    work = df[[seg_col, c2024, c2025]].copy()
+    work.columns = ["segment", "y2024", "y2025"]
 
-    # deduz pelas abas mensais 2025
-    seen = []
-    for m in MONTHS_2025:
-        if m in sheets_2025 and "Segmento" in sheets_2025[m].columns:
-            for s in sheets_2025[m]["Segmento"].astype(str):
-                if s.strip() and s not in seen:
-                    seen.append(s)
-    if "ICMS" not in seen:
-        if "FPM" in seen:
-            i = seen.index("FPM")+1
-            seen = seen[:i] + ["ICMS"] + seen[i:]
-        else:
-            seen.append("ICMS")
-    return seen if seen else MODEL_FALLBACK
+    # cast numérico
+    for c in ["y2024", "y2025"]:
+        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
 
-def load_month_liquid(sheets: dict, sheet_name: str) -> pd.DataFrame:
-    if sheet_name not in sheets: return pd.DataFrame(columns=["Segmento","Líquido"])
-    return normalize_sheet(sheets[sheet_name])[["Segmento","Líquido"]]
+    # diferenças
+    work["diff_abs"] = work["y2025"] - work["y2024"]
+    work["diff_pct"] = (work["diff_abs"] / work["y2024"].replace(0, pd.NA)) * 100
+    work["diff_pct"] = work["diff_pct"].fillna(0.0)
 
-def compare_month(sheets_2024: dict, sheets_2025: dict, m24: str, m25: str, order: list) -> pd.DataFrame:
-    df24 = load_month_liquid(sheets_2024, m24)
-    df25 = load_month_liquid(sheets_2025, m25)
-    all_segs = list(dict.fromkeys(order + df24["Segmento"].dropna().tolist() + df25["Segmento"].dropna().tolist()))
-    base = pd.DataFrame({"Segmento": all_segs})
-    merged = (
-        base.merge(df24, on="Segmento", how="left").rename(columns={"Líquido":"2024_Líquido"})
-            .merge(df25.rename(columns={"Líquido":"2025_Líquido"}), on="Segmento", how="left")
-            .fillna({"2024_Líquido":0.0,"2025_Líquido":0.0})
-    )
-    merged["Dif_abs"] = merged["2025_Líquido"] - merged["2024_Líquido"]
-    merged["Dif_%"] = merged.apply(lambda r: (r["Dif_abs"]/r["2024_Líquido"]*100.0) if r["2024_Líquido"] else None, axis=1)
-    extras = [s for s in merged["Segmento"].tolist() if s not in order]
-    final_order = order + extras
-    merged["__order"] = merged["Segmento"].apply(lambda s: final_order.index(s) if s in final_order else 999)
-    return merged.sort_values("__order").drop(columns="__order").reset_index(drop=True)
+    # ordena por maior receita 2025
+    work = work.sort_values("y2025", ascending=False).reset_index(drop=True)
+    return work
 
-def sum_semester(sheets: dict, months: list) -> pd.DataFrame:
-    acc=None
-    for m in months:
-        dfm = load_month_liquid(sheets, m)
-        if acc is None: acc=dfm.copy()
-        else:
-            acc = acc.merge(dfm, on="Segmento", how="outer", suffixes=("","_tmp"))
-            acc["Líquido"] = acc[["Líquido","Líquido_tmp"]].fillna(0.0).sum(axis=1)
-            acc = acc.drop(columns=[c for c in acc.columns if c.endswith("_tmp")])
-    if acc is None: acc = pd.DataFrame(columns=["Segmento","Líquido"])
-    return acc
+def make_download(df: pd.DataFrame, filename: str, excel: bool = False):
+    if excel:
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+            df.to_excel(writer, index=False, sheet_name="Resumo_Filtered")
+        return out.getvalue()
+    else:
+        return df.to_csv(index=False).encode("utf-8-sig")
 
-def chart_semester_bar(sem_df: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(11, 6.5))
-    x = range(len(sem_df))
-    w = 0.4
-    ax.bar([i-w/2 for i in x], sem_df["2024_Jan-Jun"], width=w, label="2024")
-    ax.bar([i+w/2 for i in x], sem_df["2025_Jan-Jun"], width=w, label="2025")
-    ax.set_xticks(list(x)); ax.set_xticklabels(sem_df["Segmento"], rotation=45, ha="right")
-    ax.yaxis.set_major_formatter(FuncFormatter(fmt_brl)); ax.set_title("Líquido por Segmento – 1º Semestre (2024 vs 2025)")
-    ax.legend(); fig.tight_layout(); return fig
+# --------------------------
+# Sidebar (arquivo)
+# --------------------------
+st.sidebar.title("📁 Fonte de Dados")
+default_path = os.environ.get("RECEITAS_FILE", "data/comparativo_receitas_2024_2025_1S_COM_ICMS.xlsx")
+uploaded = st.sidebar.file_uploader("Carregar Excel (.xlsx) com a aba 'Resumo'", type=["xlsx"])
 
-def chart_top(sem_df: pd.DataFrame, title: str, top=True):
-    d = sem_df.sort_values("Dif_abs", ascending=False)
-    d = d.head(5) if top else d.tail(5).sort_values("Dif_abs")
-    fig, ax = plt.subplots(figsize=(9,5.5))
-    ax.barh(d["Segmento"], d["Dif_abs"]); ax.xaxis.set_major_formatter(FuncFormatter(fmt_brl))
-    ax.set_title(title); fig.tight_layout(); return fig
-
-def chart_month_grouped(month_name: str, df: pd.DataFrame):
-    fig, ax = plt.subplots(figsize=(11,6.5))
-    segs=df["Segmento"].tolist(); x=range(len(segs)); w=0.4
-    ax.bar([i-w/2 for i in x], df["2024_Líquido"].tolist(), width=w, label="2024")
-    ax.bar([i+w/2 for i in x], df["2025_Líquido"].tolist(), width=w, label="2025")
-    ax.set_xticks(list(x)); ax.set_xticklabels(segs, rotation=45, ha="right"); ax.yaxis.set_major_formatter(FuncFormatter(fmt_brl))
-    ax.set_title(f"{month_name}: Líquido por Segmento"); ax.legend(); fig.tight_layout(); return fig
-
-def build_pdf(sem_df: pd.DataFrame, month_comp: dict) -> bytes:
-    buf = io.BytesIO()
-    with PdfPages(buf) as pdf:
-        total24 = sem_df["2024_Jan-Jun"].sum()
-        total25 = sem_df["2025_Jan-Jun"].sum()
-        delta = total25 - total24
-        pct = (delta/total24*100.0) if total24 else 0.0
-        fig0, ax0 = plt.subplots(figsize=(11.69,8.27)); ax0.axis("off")
-        y=0.9
-        ax0.text(0.05,y,"Relatório Comparativo 1º Semestre – 2024 x 2025",fontsize=18,weight="bold"); y-=0.08
-        ax0.text(0.05,y,f"Soma Jan–Jun 2024: {fmt_brl(total24)}",fontsize=12); y-=0.05
-        ax0.text(0.05,y,f"Soma Jan–Jun 2025: {fmt_brl(total25)}",fontsize=12); y-=0.05
-        ax0.text(0.05,y,f"Variação: {fmt_brl(delta)} ({pct:.2f}%)",fontsize=12)
-        fig0.tight_layout(); pdf.savefig(fig0); plt.close(fig0)
-
-        pdf.savefig(chart_semester_bar(sem_df)); plt.close()
-        pdf.savefig(chart_top(sem_df,"Top 5 Crescimentos (Dif_abs – Jan–Jun)",True)); plt.close()
-        pdf.savefig(chart_top(sem_df,"Top 5 Quedas (Dif_abs – Jan–Jun)",False)); plt.close()
-        pdf.savefig(chart_line_totals({k:v for k,v in month_comp.items()}, "Totais Mensais – 1º Semestre"))
-
-        for m in ["Jan","Fev","Mar","Abr","Mai","Jun"]:
-            pdf.savefig(chart_month_grouped(m, month_comp[m])); plt.close()
-    buf.seek(0); return buf.read()
-
-def build_excel(sem_df: pd.DataFrame, month_comp: dict) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as xw:
-        sem_df.to_excel(xw, index=False, sheet_name="Resumo_1S")
-        for name, df in month_comp.items():
-            df.to_excel(xw, index=False, sheet_name=name)
-    out.seek(0); return out.read()
-
-# ------------------ UI ------------------
-st.title("📊 Arrecadação — Análise e Comparativo")
-
-modo = st.radio("Escolha o modo:", ["Análise simples (1 arquivo)", "Comparativo 2024 x 2025 (2 arquivos)"], horizontal=True)
-
-if modo == "Análise simples (1 arquivo)":
-    up = st.file_uploader("Planilha (.xlsx) — 1 ou várias abas mensais", type=["xlsx","xls"])
-    if not up:
-        st.info("Envie sua planilha para começar.")
-        st.stop()
-
-    try:
-        raw = pd.read_excel(up, sheet_name=None)
-    except Exception as e:
-        st.error(f"Falha ao ler o Excel: {e}")
-        st.stop()
-
-    clean = {}
-    for name, df in raw.items():
-        nd = normalize_sheet(df)
-        if not nd.empty and nd["Segmento"].notna().any():
-            clean[name] = nd
-    if not clean:
-        st.error("Não encontrei dados válidos (preciso de Segmento/Crédito/Débito/Líquido).")
-        st.stop()
-
-    ordered = order_sheets_by_month(list(clean.keys()))
-    clean = {name: clean[name] for name in ordered}
-
-    st.sidebar.header("Opções")
-    sel = st.sidebar.selectbox("Aba para barras por segmento", ordered)
-    metric = st.sidebar.selectbox("Métrica", ["Líquido","Crédito","Débito"])
-
-    st.subheader(f"Barras por segmento — {sel} ({metric})")
-    st.pyplot(chart_bar_by_segment(clean[sel], sel, metric))
-
-    st.subheader("Linha — Total líquido por mês")
-    st.pyplot(chart_line_totals(clean))
-
-    st.subheader("Barras empilhadas — Top segmentos (Líquido)")
-    st.pyplot(chart_stacked_top_segments(clean, top_n=6))
-
-    # Download Excel normalizado + totais
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        for name, df in clean.items():
-            df.to_excel(xw, index=False, sheet_name=name[:31])
-        # totais
-        rows = [{"Mês": n, "Total_Líquido": df["Líquido"].sum()} for n, df in clean.items()]
-        pd.DataFrame(rows).to_excel(xw, index=False, sheet_name="Totais_por_mes")
-    buf.seek(0)
-    st.download_button("⬇️ Baixar Excel normalizado + totais",
-                       data=buf.read(),
-                       file_name="arrecadacao_normalizada.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+if uploaded is not None:
+    path = uploaded
 else:
-    c1, c2, c3 = st.columns([1,1,1])
-    with c1: up2024 = st.file_uploader("Excel 2024 (abas Jan_2024..Jun_2024)", type=["xlsx","xls"], key="f2024")
-    with c2: up2025 = st.file_uploader("Excel 2025 (abas Jan_2025..Jun_2025)", type=["xlsx","xls"], key="f2025")
-    with c3: upICMS = st.file_uploader("ICMS.xlsx (opcional)", type=["xlsx","xls"], key="ficms")
+    path = default_path
 
-    if not st.button("Gerar comparativo"):
-        st.stop()
+# --------------------------
+# Carregamento
+# --------------------------
+try:
+    df = load_resumo(path)
+except Exception as e:
+    st.error(f"Falha ao ler o arquivo/aba de resumo. Detalhes: {e}")
+    st.stop()
 
-    if not up2024 or not up2025:
-        st.error("Envie os dois arquivos: 2024 e 2025.")
-        st.stop()
+# --------------------------
+# Controles
+# --------------------------
+st.title("📊 Comparativo de Receitas (Resumo 1º Semestre)")
+st.caption("Clique na legenda para ocultar/mostrar uma série no gráfico. Use os filtros para focar só no que interessa.")
 
-    try:
-        sheets_2024 = read_excel_all_sheets(up2024)
-        sheets_2025 = read_excel_all_sheets(up2025)
-    except Exception as e:
-        st.error(f"Falha ao ler os Excel: {e}")
-        st.stop()
+segments = df["segment"].tolist()
+col1, col2, col3, col4 = st.columns([2,1,1,1])
 
-    # Normaliza apenas as abas que importam (Jan..Jun)
-    norm24 = {m: normalize_sheet(sheets_2024[m]) for m in MONTHS_2024 if m in sheets_2024}
-    norm25 = {m: normalize_sheet(sheets_2025[m]) for m in MONTHS_2025 if m in sheets_2025}
+with col1:
+    selected = st.multiselect("Segmentos", options=segments, default=segments)
+with col2:
+    sort_by = st.selectbox("Ordenar por", ["2025 (↓)", "Diferença (↓)", "2024 (↓)", "Alfabética (A→Z)"])
+with col3:
+    top_n = st.number_input("Top N", min_value=1, max_value=len(segments), value=min(10, len(segments)))
+with col4:
+    pct_labels = st.checkbox("Exibir % no gráfico de Diferença", value=True)
 
-    if not norm24 or not norm25:
-        st.error("Faltam abas mensais esperadas (Jan..Jun_2024 e Jan..Jun_2025).")
-        st.stop()
+# botões rápidos
+cba, cbb = st.columns(2)
+with cba:
+    if st.button("Selecionar tudo"):
+        selected = segments
+with cbb:
+    if st.button("Limpar seleção"):
+        selected = []
 
-    # ICMS opcional
-    if upICMS is not None:
-        try:
-            icms_map = parse_icms_map(read_excel_all_sheets(upICMS))
-        except Exception as e:
-            st.warning(f"Não consegui ler ICMS.xlsx ({e}). Prosseguindo sem ICMS extra.")
-            icms_map = {}
-        for m in MONTHS_2024:
-            if m in norm24 and 2024 in icms_map:
-                mon = m.split("_")[0]
-                norm24[m] = upsert_icms_row(norm24[m], icms_map[2024].get(mon))
-        for m in MONTHS_2025:
-            if m in norm25 and 2025 in icms_map:
-                mon = m.split("_")[0]
-                norm25[m] = upsert_icms_row(norm25[m], icms_map[2025].get(mon))
+fdf = df[df["segment"].isin(selected)].copy()
 
-    # Ordem de segmentos (preferindo "Resumo Jan-Jul 2025" se existir)
-    model_order = find_model_order_from_2025(sheets_2025)
+# ordenação
+if sort_by == "2025 (↓)":
+    fdf = fdf.sort_values("y2025", ascending=False)
+elif sort_by == "2024 (↓)":
+    fdf = fdf.sort_values("y2024", ascending=False)
+elif sort_by == "Diferença (↓)":
+    fdf = fdf.sort_values("diff_abs", ascending=False)
+else:
+    fdf = fdf.sort_values("segment", ascending=True)
 
-    # Comparativos mensais
-    month_comp = {}
-    for m24, m25, label in zip(MONTHS_2024, MONTHS_2025, ["Jan","Fev","Mar","Abr","Mai","Jun"]):
-        df = compare_month(norm24, norm25, m24, m25, model_order)
-        month_comp[label] = df
+fdf = fdf.head(top_n)
 
-    # Resumo semestre
-    sem24 = sum_semester(norm24, MONTHS_2024).rename(columns={"Líquido":"2024_Jan-Jun"})
-    sem25 = sum_semester(norm25, MONTHS_2025).rename(columns={"Líquido":"2025_Jan-Jun"})
-    base = pd.DataFrame({"Segmento": list(dict.fromkeys(model_order + sem24["Segmento"].dropna().tolist() + sem25["Segmento"].dropna().tolist()))})
-    sem_df = (base.merge(sem24, on="Segmento", how="left")
-                   .merge(sem25, on="Segmento", how="left")
-                   .fillna({"2024_Jan-Jun":0.0,"2025_Jan-Jun":0.0}))
-    sem_df["Dif_abs"] = sem_df["2025_Jan-Jun"] - sem_df["2024_Jan-Jun"]
-    sem_df["Dif_%"] = sem_df.apply(lambda r: (r["Dif_abs"]/r["2024_Jan-Jun"]*100.0) if r["2024_Jan-Jun"] else None, axis=1)
-    extras = [s for s in sem_df["Segmento"].tolist() if s not in model_order]
-    final_order = model_order + extras
-    sem_df["__order"] = sem_df["Segmento"].apply(lambda s: final_order.index(s) if s in final_order else 999)
-    sem_df = sem_df.sort_values("__order").drop(columns="__order").reset_index(drop=True)
+# --------------------------
+# Gráficos
+# --------------------------
+left, right = st.columns(2)
 
-    # Exibição
-    st.subheader("Resumo 1º Semestre (Jan–Jun)")
-    st.dataframe(sem_df, use_container_width=True)
+with left:
+    st.subheader("Barras Agrupadas (2024 x 2025)")
+    plot_df = fdf.melt(id_vars=["segment"], value_vars=["y2024", "y2025"], var_name="year", value_name="value")
+    plot_df["year"] = plot_df["year"].map({"y2024": "2024 (Jan-Jun)", "y2025": "2025 (Jan-Jun)"})
+    fig1 = px.bar(
+        plot_df, x="segment", y="value", color="year", barmode="group",
+        labels={"segment": "Segmento", "value": "Receita (R$)", "year": "Ano"}
+    )
+    fig1.update_layout(xaxis_tickangle=-30, yaxis_title=None, legend_title_text="Ano", margin=dict(l=10,r=10,t=40,b=10))
+    st.plotly_chart(fig1, use_container_width=True, theme="streamlit")
 
-    c1,c2 = st.columns(2)
-    with c1:
-        st.pyplot(chart_semester_bar(sem_df))
-        st.pyplot(chart_line_totals(month_comp, "Totais Mensais – 1º Semestre"))
-    with c2:
-        st.pyplot(chart_top(sem_df,"Top 5 Crescimentos (Dif_abs – Jan–Jun)",True))
-        st.pyplot(chart_top(sem_df,"Top 5 Quedas (Dif_abs – Jan–Jun)",False))
+with right:
+    st.subheader("Barras Divergentes (2024 vs 2025)")
+    b2024 = go.Bar(
+        x=-fdf["y2024"], y=fdf["segment"], name="2024 (Jan-Jun)", orientation="h"
+    )
+    b2025 = go.Bar(
+        x=fdf["y2025"], y=fdf["segment"], name="2025 (Jan-Jun)", orientation="h"
+    )
+    fig2 = go.Figure(data=[b2024, b2025])
+    fig2.update_layout(barmode="relative", margin=dict(l=10,r=10,t=40,b=10))
+    fig2.update_xaxes(title_text="Receita (R$) — valores de 2024 à esquerda")
+    st.plotly_chart(fig2, use_container_width=True, theme="streamlit")
 
-    for m in ["Jan","Fev","Mar","Abr","Mai","Jun"]:
-        st.pyplot(chart_month_grouped(m, month_comp[m]))
+st.subheader("Diferença Absoluta (2025 - 2024)")
+fdf2 = fdf.sort_values("diff_abs", ascending=False).copy()
+fig3 = px.bar(
+    fdf2, x="segment", y="diff_abs", labels={"segment": "Segmento", "diff_abs": "Diferença (R$)"}
+)
+if pct_labels:
+    fig3.update_traces(text=[f"{p:.1f}%" for p in fdf2["diff_pct"]], textposition="outside")
+fig3.update_layout(xaxis_tickangle=-30, yaxis_title=None, margin=dict(l=10,r=10,t=40,b=10))
+st.plotly_chart(fig3, use_container_width=True, theme="streamlit")
 
-    # Downloads
-    xlsx_bytes = build_excel(sem_df, month_comp)
-    pdf_bytes  = build_pdf(sem_df, month_comp)
-    st.download_button("⬇️ Baixar Excel (Resumo_1S + Jan..Jun)", data=xlsx_bytes,
-                       file_name="comparativo_receitas_2024_2025_1S.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    st.download_button("⬇️ Baixar PDF (gráficos)", data=pdf_bytes,
-                       file_name="relatorio_comparativo_1S_2024_2025.pdf",
-                       mime="application/pdf")
+# --------------------------
+# Tabela + downloads
+# --------------------------
+st.subheader("Tabela Filtrada")
+show = fdf[["segment", "y2024", "y2025", "diff_abs", "diff_pct"]].rename(columns={
+    "segment": "Segmento",
+    "y2024": "2024_Jan-Jun",
+    "y2025": "2025_Jan-Jun",
+    "diff_abs": "Dif_abs",
+    "diff_pct": "Dif_%"
+})
+st.dataframe(
+    show.style.format({
+        "2024_Jan-Jun": format_brl,
+        "2025_Jan-Jun": format_brl,
+        "Dif_abs": format_brl,
+        "Dif_%": lambda v: f"{v:.1f}%"
+    }),
+    use_container_width=True, hide_index=True
+)
+
+csv_data = make_download(show, "resumo_filtrado.csv", excel=False)
+xlsx_data = make_download(show, "resumo_filtrado.xlsx", excel=True)
+
+col_dl1, col_dl2, col_dl3 = st.columns([1,1,4])
+with col_dl1:
+    st.download_button("Baixar CSV", data=csv_data, file_name="resumo_filtrado.csv", mime="text/csv")
+with col_dl2:
+    st.download_button("Baixar Excel", data=xlsx_data, file_name="resumo_filtrado.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+st.caption("Dica: o gráfico aceita esconder/mostrar séries clicando na legenda.")
