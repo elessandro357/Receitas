@@ -127,7 +127,7 @@ except Exception as e:
 # Controles
 # ==========================
 st.title("📊 Comparativo de Receitas (Resumo)")
-st.caption("Envie sua planilha acima. Foco apenas em valores em reais (sem %). Use os filtros para focar no que interessa.")
+st.caption("Valores em reais (sem %). Filtros abaixo.")
 
 segments = df["segment"].tolist()
 col1, col2, col3 = st.columns([2, 1, 1])
@@ -151,20 +151,60 @@ else:
 fdf = fdf.head(top_n)
 
 # ==========================
-# Totais (cards)
+# Totais (cards SEM cortar)
 # ==========================
 total_2024 = float(fdf["y2024"].sum())
 total_2025 = float(fdf["y2025"].sum())
 total_diff = total_2025 - total_2024
 
-m1, m2, m3 = st.columns(3)
-with m1:
-    st.metric("Total 2024 (período)", format_brl(total_2024))
-with m2:
-    st.metric("Total 2025 (período)", format_brl(total_2025))
-with m3:
-    # delta fica visual, mas é apenas R$ (sem %)
-    st.metric("Diferença (2025 - 2024)", format_brl(total_diff))
+# CSS para cards que não cortam valores
+st.markdown("""
+<style>
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(260px, 1fr));
+  gap: 10px;
+}
+.card {
+  background: #f6f8fb;
+  border: 1px solid #e6eaf0;
+  border-radius: 12px;
+  padding: 12px 16px;
+}
+.card .label {
+  font-size: 0.95rem;
+  color: #333;
+  margin-bottom: 6px;
+}
+.card .value {
+  font-size: 1.35rem;
+  font-weight: 700;
+  line-height: 1.25;
+  word-break: break-word;     /* NÃO corta com reticências */
+  white-space: normal;
+}
+@media (max-width: 900px) {
+  .card-grid { grid-template-columns: 1fr; }
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(f"""
+<div class="card-grid">
+  <div class="card">
+    <div class="label">Total 2024 (período)</div>
+    <div class="value">{format_brl(total_2024)}</div>
+  </div>
+  <div class="card">
+    <div class="label">Total 2025 (período)</div>
+    <div class="value">{format_brl(total_2025)}</div>
+  </div>
+  <div class="card">
+    <div class="label">Diferença (2025 - 2024)</div>
+    <div class="value">{format_brl(total_diff)}</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 # ==========================
 # Gráficos (com rótulos em R$)
@@ -175,7 +215,6 @@ with left:
     st.subheader("Barras Agrupadas (2024 x 2025)")
     plot_df = fdf.melt(id_vars=["segment"], value_vars=["y2024", "y2025"], var_name="year", value_name="value")
     plot_df["year"] = plot_df["year"].map({"y2024": "2024", "y2025": "2025"})
-    # rótulos formatados
     plot_df["label_brl"] = plot_df["value"].map(format_brl)
     fig1 = px.bar(
         plot_df, x="segment", y="value", color="year", barmode="group",
@@ -215,7 +254,7 @@ fig3.update_yaxes(tickprefix="R$ ")
 st.plotly_chart(fig3, use_container_width=True, theme="streamlit")
 
 # ==========================
-# Tabela + downloads (sem %)
+# Tabela + downloads (somente R$)
 # ==========================
 st.subheader("Tabela Filtrada (somente R$)")
 show = fdf[["segment", "y2024", "y2025", "diff_abs"]].rename(columns={
